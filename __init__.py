@@ -6,6 +6,7 @@ import einops
 from comfy.model_patcher import ModelPatcher
 from comfy.ldm.modules.attention import optimized_attention, optimized_attention_masked
 import comfy.ops
+from typing import Union
 
 T = torch.Tensor
 
@@ -78,78 +79,26 @@ def sdpa(q: T, k: T, v: T, mask=None, heads: int = 8) -> T:
 class SharedAttentionProcessor:
     def __init__(
         self,
-        style_aligned_args: StyleAlignedArgs,
-        query_dim,
-        context_dim=None,
-        heads=8,
-        dim_head=64,
-        dropout=0.0,
-        dtype=None,
-        device=None,
-        operations=comfy.ops,
+        args: StyleAlignedArgs,
     ):
-        super().__init__()
-        self.args = style_aligned_args
-        inner_dim = dim_head * heads
-        context_dim = default(context_dim, query_dim)
-        assert context_dim
+        self.args = args
 
-        self.heads = heads
-        self.dim_head = dim_head
-
-        self.to_q = operations.Linear(
-            query_dim, inner_dim, bias=False, dtype=dtype, device=device
-        )
-        self.to_k = operations.Linear(
-            context_dim, inner_dim, bias=False, dtype=dtype, device=device
-        )
-        self.to_v = operations.Linear(
-            context_dim, inner_dim, bias=False, dtype=dtype, device=device
-        )
-
-        self.to_out = nn.Sequential(
-            operations.Linear(inner_dim, query_dim, dtype=dtype, device=device),
-            nn.Dropout(dropout),
-        )
-
-    def shifted_scaled_dot_product_attention(self, query: T, key: T, value: T) -> T:
-        logits = torch.einsum("bhqd,bhkd->bhqk", query, key)
-        logits[:, :, :, query.shape[2] :] += self.args.shared_score_shift
-        probs = logits.softmax(-1)
-        return torch.einsum("bhqk,bhkd->bhqd", probs, value)
-
-    def forward(self, x, context=None, value=None, mask=None):
-        query = self.to_q(x)
-        context = default(context, x)
-        key = self.to_k(context)
-        v = self.to_v(x)
-        if value is not None:
-            v = self.to_v(value)
-            del value
-        else:
-            v = self.to_v(context)
+    def __call__(self, q, k, v, extra_options):
+        current_index = "{}_{}".format(extra_options["transformer_index"], extra_options["block_index"])
+        print(f"SharedAttentionProcessor: patch {current_index}")
+        breakpoint()
 
         if self.args.adain_queries:
-            query = adain(query)
+            q = adain(q)
         if self.args.adain_keys:
-            key = adain(key)
+            k = adain(k)
         if self.args.adain_values:
             v = adain(v)
         if self.args.share_attention:
-            key = concat_first(key, -2, scale=self.args.shared_score_scale)
+            k = concat_first(k, -2, scale=self.args.shared_score_scale)
             v = concat_first(v, -2)
-            if self.args.shared_score_shift != 0:
-                x = self.shifted_scaled_dot_product_attention(
-                    query,
-                    key,
-                    v,
-                )
-            else:
-                x = sdpa(query, key, v, mask, self.heads)
-        else:
-            x = sdpa(query, key, v, mask, self.heads)
 
-        return x
+        return q, k, v
 
 def register_shared_norm(
     model: ModelPatcher,
@@ -157,8 +106,8 @@ def register_shared_norm(
     share_layer_norm: bool = True,
 ):
     def register_norm_forward(
-        norm_layer: nn.GroupNorm | nn.LayerNorm,
-    ) -> nn.GroupNorm | nn.LayerNorm:
+        norm_layer: Union[nn.GroupNorm, nn.LayerNorm],
+    ) -> Union[nn.GroupNorm, nn.LayerNorm]:
         if not hasattr(norm_layer, "orig_forward"):
             setattr(norm_layer, "orig_forward", norm_layer.forward)
         orig_forward = norm_layer.orig_forward
@@ -173,7 +122,7 @@ def register_shared_norm(
         return norm_layer
 
     def get_norm_layers(
-        layer, norm_layers_: dict[str, list[nn.GroupNorm | nn.LayerNorm]]
+        layer, norm_layers_: dict[str, list[Union[nn.GroupNorm, nn.LayerNorm]]]
     ):
         if isinstance(layer, nn.LayerNorm) and share_layer_norm:
             norm_layers_["layer"].append(layer)
@@ -190,6 +139,7 @@ def register_shared_norm(
     ]
 
 
+# TODO not implemented.
 def _get_switch_vec(total_num_layers, level):
     if level == 0:
         return torch.zeros(total_num_layers, dtype=torch.bool)
@@ -206,25 +156,6 @@ def _get_switch_vec(total_num_layers, level):
         vec = ~vec
     return vec
 
-
-def init_attention_processors(model, style_aligned_args: StyleAlignedArgs):
-    attn_procs = {}
-    number_of_self, number_of_cross = 0, 0
-    num_self_layers = len(
-        [name for name in model.keys() if "attn1" in name]
-    )
-    if style_aligned_args is None:
-        only_self_vec = _get_switch_vec(num_self_layers, 1)
-    else:
-        only_self_vec = _get_switch_vec(
-            num_self_layers, style_aligned_args.only_self_level
-        )
-    for i, name in enumerate(model.keys()):
-        is_self_attention = "attn1" in name
-        if is_self_attention:
-            number_of_self += 1
-            if only_self_vec[i // 2]:
-                attn_procs[name] = SharedAttentionProcessor(style_aligned_args)
 
 
 class StyleAlignedPatch:
@@ -243,9 +174,11 @@ class StyleAlignedPatch:
 
     def __init__(self, model: ModelPatcher) -> None:
         self.args = StyleAlignedArgs()
-        self.norm_layers = register_shared_norm(
-            model, self.args.share_group_norm, self.args.share_layer_norm
-        )
+        # TODO patch norm layers
+        # self.norm_layers = register_shared_norm(
+        #     model, self.args.share_group_norm, self.args.share_layer_norm
+        # )
+        model.set_model_attn1_patch(SharedAttentionProcessor(self.args))
 
     def patch(self, model):
         m = model.clone()
