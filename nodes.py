@@ -68,22 +68,11 @@ def adain(feat: T) -> T:
     return feat
 
 
-class CrossAttention(nn.Module):
-    def forward(self, x, context=None, value=None, mask=None):
-        q = self.to_q(x)
-        context = default(context, x)
-        k = self.to_k(context)
-        if value is not None:
-            v = self.to_v(value)
-            del value
-        else:
-            v = self.to_v(context)
-
-        if mask is None:
-            out = optimized_attention(q, k, v, self.heads)
-        else:
-            out = optimized_attention_masked(q, k, v, self.heads, mask)
-        return self.to_out(out)
+def sdpa(q: T, k: T, v: T, mask=None, heads: int = 8) -> T:
+    if mask:
+        return optimized_attention_masked(q, k, v, heads, mask)
+    else:
+        return optimized_attention(q, k, v, heads)
 
 
 class SharedAttentionProcessor:
@@ -123,130 +112,44 @@ class SharedAttentionProcessor:
             nn.Dropout(dropout),
         )
 
-    def shifted_scaled_dot_product_attention(
-        self, attn, query: T, key: T, value: T
-    ) -> T:
-        logits = torch.einsum("bhqd,bhkd->bhqk", query, key) * attn.scale
+    def shifted_scaled_dot_product_attention(self, query: T, key: T, value: T) -> T:
+        logits = torch.einsum("bhqd,bhkd->bhqk", query, key)
         logits[:, :, :, query.shape[2] :] += self.args.shared_score_shift
         probs = logits.softmax(-1)
         return torch.einsum("bhqk,bhkd->bhqd", probs, value)
 
-    def shared_call(
-        self,
-        hidden_states,
-        encoder_hidden_states=None,
-        attention_mask=None,
-    ):
-        residual = hidden_states
-        input_ndim = hidden_states.ndim
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(
-                batch_size, channel, height * width
-            ).transpose(1, 2)
-        batch_size, sequence_length, _ = (
-            hidden_states.shape
-            if encoder_hidden_states is None
-            else encoder_hidden_states.shape
-        )
-
-        if attention_mask is not None:
-            attention_mask = prepare_attention_mask(
-                attention_mask, sequence_length, batch_size
-            )
-            # scaled_dot_product_attention expects attention_mask shape to be
-            # (batch, heads, source_length, target_length)
-            attention_mask = attention_mask.view(
-                batch_size, self.heads, -1, attention_mask.shape[-1]
-            )
-
-        if attn.group_norm is not None:
-            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(
-                1, 2
-            )
-
-        query = self.to_q(hidden_states)
-        key = self.to_k(hidden_states)
-        value = self.to_v(hidden_states)
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        # if self.step >= self.start_inject:
-        if self.args.adain_queries:
-            query = adain(query)
-        if self.args.adain_keys:
-            key = adain(key)
-        if self.args.adain_values:
-            value = adain(value)
-        if self.args.share_attention:
-            key = concat_first(key, -2, scale=self.args.shared_score_scale)
-            value = concat_first(value, -2)
-            if self.args.shared_score_shift != 0:
-                hidden_states = self.shifted_scaled_dot_product_attention(
-                    attn,
-                    query,
-                    key,
-                    value,
-                )
-            else:
-                hidden_states = nnf.scaled_dot_product_attention(
-                    query,
-                    key,
-                    value,
-                    attn_mask=attention_mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                )
-        else:
-            hidden_states = nnf.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                is_causal=False,
-            )
-        # hidden_states = adain(hidden_states)
-        hidden_states = hidden_states.transpose(1, 2).reshape(
-            batch_size, -1, attn.heads * head_dim
-        )
-        hidden_states = hidden_states.to(query.dtype)
-
-        # linear proj
-        hidden_states = attn.to_out[0](hidden_states)
-        # dropout
-        hidden_states = attn.to_out[1](hidden_states)
-
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(
-                batch_size, channel, height, width
-            )
-
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
-
-        hidden_states = hidden_states / attn.rescale_output_factor
-        return hidden_states
-
     def forward(self, x, context=None, value=None, mask=None):
-        q = self.to_q(x)
+        query = self.to_q(x)
         context = default(context, x)
-        k = self.to_k(context)
+        key = self.to_k(context)
+        v = self.to_v(x)
         if value is not None:
             v = self.to_v(value)
             del value
         else:
             v = self.to_v(context)
 
-        if mask is None:
-            out = optimized_attention(q, k, v, self.heads)
+        if self.args.adain_queries:
+            query = adain(query)
+        if self.args.adain_keys:
+            key = adain(key)
+        if self.args.adain_values:
+            v = adain(v)
+        if self.args.share_attention:
+            key = concat_first(key, -2, scale=self.args.shared_score_scale)
+            v = concat_first(v, -2)
+            if self.args.shared_score_shift != 0:
+                x = self.shifted_scaled_dot_product_attention(
+                    query,
+                    key,
+                    v,
+                )
+            else:
+                x = sdpa(query, key, v, mask, self.heads)
         else:
-            out = optimized_attention_masked(q, k, v, self.heads, mask)
-        return self.to_out(out)
+            x = sdpa(query, key, v, mask, self.heads)
 
+        return x
 
 def register_shared_norm(
     model: ModelPatcher,
@@ -304,12 +207,11 @@ def _get_switch_vec(total_num_layers, level):
     return vec
 
 
-def init_attention_processors(pipeline, style_aligned_args: StyleAlignedArgs):
+def init_attention_processors(model, style_aligned_args: StyleAlignedArgs):
     attn_procs = {}
-    unet = pipeline.unet
     number_of_self, number_of_cross = 0, 0
     num_self_layers = len(
-        [name for name in unet.attn_processors.keys() if "attn1" in name]
+        [name for name in model.keys() if "attn1" in name]
     )
     if style_aligned_args is None:
         only_self_vec = _get_switch_vec(num_self_layers, 1)
@@ -317,7 +219,7 @@ def init_attention_processors(pipeline, style_aligned_args: StyleAlignedArgs):
         only_self_vec = _get_switch_vec(
             num_self_layers, style_aligned_args.only_self_level
         )
-    for i, name in enumerate(unet.attn_processors.keys()):
+    for i, name in enumerate(model.keys()):
         is_self_attention = "attn1" in name
         if is_self_attention:
             number_of_self += 1
