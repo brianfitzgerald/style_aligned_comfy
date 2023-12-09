@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+from torch.nn import functional as nnf
+import einops
 
 T = torch.Tensor
 
@@ -51,6 +53,110 @@ def adain(feat: T) -> T:
     feat = (feat - feat_mean) / feat_std
     feat = feat * feat_style_std + feat_style_mean
     return feat
+
+class SharedAttentionProcessor:
+
+    def shifted_scaled_dot_product_attention(self, attn, query: T, key: T, value: T) -> T:
+        logits = torch.einsum('bhqd,bhkd->bhqk', query, key) * attn.scale
+        logits[:, :, :, query.shape[2]:] += self.shared_score_shift
+        probs = logits.softmax(-1)
+        return torch.einsum('bhqk,bhkd->bhqd', probs, value)
+
+    def shared_call(
+            self,
+            attn,
+            hidden_states,
+            encoder_hidden_states=None,
+            attention_mask=None,
+    ):
+
+        residual = hidden_states
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            # scaled_dot_product_attention expects attention_mask shape to be
+            # (batch, heads, source_length, target_length)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        # if self.step >= self.start_inject:
+        if self.adain_queries:
+            query = adain(query)
+        if self.adain_keys:
+            key = adain(key)
+        if self.adain_values:
+            value = adain(value)
+        if self.share_attention:
+            key = concat_first(key, -2, scale=self.shared_score_scale)
+            value = concat_first(value, -2)
+            if self.shared_score_shift != 0:
+                hidden_states = self.shifted_scaled_dot_product_attention(attn, query, key, value,)
+            else:
+                hidden_states = nnf.scaled_dot_product_attention(
+                    query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+                )
+        else:
+            hidden_states = nnf.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
+        # hidden_states = adain(hidden_states)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, **kwargs):
+        if self.full_attention_share:
+            b, n, d = hidden_states.shape
+            hidden_states = einops.rearrange(hidden_states, '(k b) n d -> k (b n) d', k=2)
+            hidden_states = super().__call__(attn, hidden_states, encoder_hidden_states=encoder_hidden_states,
+                                             attention_mask=attention_mask, **kwargs)
+            hidden_states = einops.rearrange(hidden_states, 'k (b n) d -> (k b) n d', n=n)
+        else:
+            hidden_states = self.shared_call(attn, hidden_states, hidden_states, attention_mask, **kwargs)
+
+        return hidden_states
+
+    def __init__(self, style_aligned_args: StyleAlignedArgs):
+        super().__init__()
+        self.share_attention = style_aligned_args.share_attention
+        self.adain_queries = style_aligned_args.adain_queries
+        self.adain_keys = style_aligned_args.adain_keys
+        self.adain_values = style_aligned_args.adain_values
+        self.full_attention_share = style_aligned_args.full_attention_share
+        self.shared_score_scale = style_aligned_args.shared_score_scale
+        self.shared_score_shift = style_aligned_args.shared_score_shift
 
 
 def register_shared_norm(
