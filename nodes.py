@@ -5,6 +5,7 @@ from torch.nn import functional as nnf
 import einops
 from comfy.model_patcher import ModelPatcher
 from comfy.ldm.modules.attention import optimized_attention, optimized_attention_masked
+import comfy.ops
 
 T = torch.Tensor
 
@@ -68,8 +69,27 @@ def adain(feat: T) -> T:
 
 
 class CrossAttention(nn.Module):
+    def forward(self, x, context=None, value=None, mask=None):
+        q = self.to_q(x)
+        context = default(context, x)
+        k = self.to_k(context)
+        if value is not None:
+            v = self.to_v(value)
+            del value
+        else:
+            v = self.to_v(context)
+
+        if mask is None:
+            out = optimized_attention(q, k, v, self.heads)
+        else:
+            out = optimized_attention_masked(q, k, v, self.heads, mask)
+        return self.to_out(out)
+
+
+class SharedAttentionProcessor:
     def __init__(
         self,
+        style_aligned_args: StyleAlignedArgs,
         query_dim,
         context_dim=None,
         heads=8,
@@ -80,8 +100,10 @@ class CrossAttention(nn.Module):
         operations=comfy.ops,
     ):
         super().__init__()
+        self.args = style_aligned_args
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
+        assert context_dim
 
         self.heads = heads
         self.dim_head = dim_head
@@ -101,28 +123,6 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x, context=None, value=None, mask=None):
-        q = self.to_q(x)
-        context = default(context, x)
-        k = self.to_k(context)
-        if value is not None:
-            v = self.to_v(value)
-            del value
-        else:
-            v = self.to_v(context)
-
-        if mask is None:
-            out = optimized_attention(q, k, v, self.heads)
-        else:
-            out = optimized_attention_masked(q, k, v, self.heads, mask)
-        return self.to_out(out)
-
-
-class SharedAttentionProcessor:
-    def __init__(self, style_aligned_args: StyleAlignedArgs):
-        super().__init__()
-        self.args = style_aligned_args
-
     def shifted_scaled_dot_product_attention(
         self, attn, query: T, key: T, value: T
     ) -> T:
@@ -133,7 +133,6 @@ class SharedAttentionProcessor:
 
     def shared_call(
         self,
-        attn,
         hidden_states,
         encoder_hidden_states=None,
         attention_mask=None,
@@ -152,13 +151,13 @@ class SharedAttentionProcessor:
         )
 
         if attention_mask is not None:
-            attention_mask = attn.prepare_attention_mask(
+            attention_mask = prepare_attention_mask(
                 attention_mask, sequence_length, batch_size
             )
             # scaled_dot_product_attention expects attention_mask shape to be
             # (batch, heads, source_length, target_length)
             attention_mask = attention_mask.view(
-                batch_size, attn.heads, -1, attention_mask.shape[-1]
+                batch_size, self.heads, -1, attention_mask.shape[-1]
             )
 
         if attn.group_norm is not None:
@@ -166,9 +165,9 @@ class SharedAttentionProcessor:
                 1, 2
             )
 
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
+        query = self.to_q(hidden_states)
+        key = self.to_k(hidden_states)
+        value = self.to_v(hidden_states)
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
 
@@ -183,7 +182,7 @@ class SharedAttentionProcessor:
         if self.args.adain_values:
             value = adain(value)
         if self.args.share_attention:
-            key = concat_first(key, -2, scale=self.shared_score_scale)
+            key = concat_first(key, -2, scale=self.args.shared_score_scale)
             value = concat_first(value, -2)
             if self.args.shared_score_shift != 0:
                 hidden_states = self.shifted_scaled_dot_product_attention(
@@ -232,35 +231,21 @@ class SharedAttentionProcessor:
         hidden_states = hidden_states / attn.rescale_output_factor
         return hidden_states
 
-    def __call__(
-        self,
-        attn,
-        hidden_states,
-        encoder_hidden_states=None,
-        attention_mask=None,
-        **kwargs
-    ):
-        if self.full_attention_share:
-            b, n, d = hidden_states.shape
-            hidden_states = einops.rearrange(
-                hidden_states, "(k b) n d -> k (b n) d", k=2
-            )
-            hidden_states = super().__call__(
-                attn,
-                hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=attention_mask,
-                **kwargs
-            )
-            hidden_states = einops.rearrange(
-                hidden_states, "k (b n) d -> (k b) n d", n=n
-            )
+    def forward(self, x, context=None, value=None, mask=None):
+        q = self.to_q(x)
+        context = default(context, x)
+        k = self.to_k(context)
+        if value is not None:
+            v = self.to_v(value)
+            del value
         else:
-            hidden_states = self.shared_call(
-                attn, hidden_states, hidden_states, attention_mask, **kwargs
-            )
+            v = self.to_v(context)
 
-        return hidden_states
+        if mask is None:
+            out = optimized_attention(q, k, v, self.heads)
+        else:
+            out = optimized_attention_masked(q, k, v, self.heads, mask)
+        return self.to_out(out)
 
 
 def register_shared_norm(
