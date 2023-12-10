@@ -80,13 +80,13 @@ class SharedAttentionProcessor:
     def __init__(
         self,
         args: StyleAlignedArgs,
+        style_image: T
     ):
         self.args = args
+        self.ref_img = style_image
 
     def __call__(self, q, k, v, extra_options):
         current_index = "{}_{}".format(extra_options["transformer_index"], extra_options["block_index"])
-        print(f"SharedAttentionProcessor: patch {current_index}")
-        breakpoint()
 
         if self.args.adain_queries:
             q = adain(q)
@@ -172,16 +172,16 @@ class StyleAlignedPatch:
     FUNCTION = "patch"
     CATEGORY = "custom_node_experiments"
 
-    def __init__(self, model: ModelPatcher) -> None:
+    def __init__(self) -> None:
         self.args = StyleAlignedArgs()
         # TODO patch norm layers
         # self.norm_layers = register_shared_norm(
         #     model, self.args.share_group_norm, self.args.share_layer_norm
         # )
-        model.set_model_attn1_patch(SharedAttentionProcessor(self.args))
 
-    def patch(self, model):
+    def patch(self, model: ModelPatcher, style_image: T):
         m = model.clone()
+        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, style_image))
         return (m,)
 
 
