@@ -31,7 +31,7 @@ class StyleAlignedArgs:
     only_self_level: float = 0.0
 
 
-def expand_first(
+def expand_ref(
     feat: T,
     scale=1.0,
 ) -> T:
@@ -45,8 +45,8 @@ def expand_first(
     return feat_style.reshape(*feat.shape)
 
 
-def concat_first(feat: T, dim=2, scale=1.0) -> T:
-    feat_style = expand_first(feat, scale=scale)
+def concat_ref(feat: T, dim=2, scale=1.0) -> T:
+    feat_style = expand_ref(feat, scale=scale)
     return torch.cat((feat, feat_style), dim=dim)
 
 
@@ -58,8 +58,8 @@ def calc_mean_std(feat, eps: float = 1e-5) -> tuple[T, T]:
 
 def adain(feat: T) -> T:
     feat_mean, feat_std = calc_mean_std(feat)
-    feat_style_mean = expand_first(feat_mean)
-    feat_style_std = expand_first(feat_std)
+    feat_style_mean = expand_ref(feat_mean)
+    feat_style_std = expand_ref(feat_std)
     feat = (feat - feat_mean) / feat_std
     feat = feat * feat_style_std + feat_style_mean
     return feat
@@ -86,8 +86,8 @@ class SharedAttentionProcessor:
         if self.args.adain_values:
             v = adain(v)
         if self.args.share_attention:
-            k = concat_first(k, -2, scale=self.scale)
-            v = concat_first(v, -2)
+            k = concat_ref(k, -2, scale=self.scale)
+            v = concat_ref(v, -2)
 
         return q, k, v
 
@@ -118,7 +118,7 @@ def register_norm_forward(
 
     def forward_(hidden_states: T) -> T:
         n = hidden_states.shape[-2]
-        hidden_states = concat_first(hidden_states, dim=-2)
+        hidden_states = concat_ref(hidden_states, dim=-2)
         hidden_states = orig_forward(hidden_states)
         return hidden_states[..., :n, :]
 
@@ -151,7 +151,7 @@ class StyleAlignedPatch:
                 "scale": ("FLOAT", {"default": 1, "min": 0, "max": 1.0, "step": 0.1}),
             },
             "optional": {
-                "style_image": ("IMAGE",),
+                "latent_ref": ("LATENT",),
             },
         }
 
@@ -167,13 +167,13 @@ class StyleAlignedPatch:
         model: ModelPatcher,
         share_norm: str,
         scale: float,
-        style_image: Optional[T] = None,
+        latent_ref: Optional[T] = None,
     ):
         m = model.clone()
         share_group_norm = share_norm in ["group", "both"]
         share_layer_norm = share_norm in ["layer", "both"]
         register_shared_norm(model, share_group_norm, share_layer_norm)
-        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale, style_image))
+        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale, latent_ref))
         return (m,)
 
 
