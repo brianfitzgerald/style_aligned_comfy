@@ -23,14 +23,10 @@ def default(val, d):
 
 @dataclass(frozen=True)
 class StyleAlignedArgs:
-    share_group_norm: bool = True
-    share_layer_norm: bool = True
     share_attention: bool = True
     adain_queries: bool = True
     adain_keys: bool = True
     adain_values: bool = False
-    full_attention_share: bool = False
-    shared_score_scale: float = 1.0
     shared_score_shift: float = 0.0
     only_self_level: float = 0.0
 
@@ -77,15 +73,12 @@ def sdpa(q: T, k: T, v: T, mask=None, heads: int = 8) -> T:
 
 
 class SharedAttentionProcessor:
-    def __init__(self, args: StyleAlignedArgs, style_image: Optional[T]):
+    def __init__(self, args: StyleAlignedArgs, scale: float, style_image: Optional[T]):
         self.args = args
         self.ref_img = style_image
+        self.scale = scale
 
     def __call__(self, q, k, v, extra_options):
-        current_index = "{}_{}".format(
-            extra_options["transformer_index"], extra_options["block_index"]
-        )
-
         if self.args.adain_queries:
             q = adain(q)
         if self.args.adain_keys:
@@ -93,7 +86,7 @@ class SharedAttentionProcessor:
         if self.args.adain_values:
             v = adain(v)
         if self.args.share_attention:
-            k = concat_first(k, -2, scale=self.args.shared_score_scale)
+            k = concat_first(k, -2, scale=self.scale)
             v = concat_first(v, -2)
 
         return q, k, v
@@ -105,12 +98,6 @@ def get_norm_layers(
     share_layer_norm: bool,
     share_group_norm: bool,
 ):
-    print(
-        "get layer",
-        layer.__class__.__name__,
-        isinstance(layer, nn.LayerNorm),
-        isinstance(layer, nn.GroupNorm),
-    )
     if isinstance(layer, nn.LayerNorm) and share_layer_norm:
         norm_layers_["layer"].append(layer)
     if isinstance(layer, nn.GroupNorm) and share_group_norm:
@@ -146,28 +133,12 @@ def register_shared_norm(
 ):
     norm_layers = {"group": [], "layer": []}
     get_norm_layers(model.model, norm_layers, share_layer_norm, share_group_norm)
-    print(f"Patching {len(norm_layers['group'])} group norms, {len(norm_layers['layer'])} layer norms.")
+    print(
+        f"Patching {len(norm_layers['group'])} group norms, {len(norm_layers['layer'])} layer norms."
+    )
     return [register_norm_forward(layer) for layer in norm_layers["group"]] + [
         register_norm_forward(layer) for layer in norm_layers["layer"]
     ]
-
-
-# TODO not implemented.
-def _get_switch_vec(total_num_layers, level):
-    if level == 0:
-        return torch.zeros(total_num_layers, dtype=torch.bool)
-    if level == 1:
-        return torch.ones(total_num_layers, dtype=torch.bool)
-    to_flip = level > 0.5
-    if to_flip:
-        level = 1 - level
-    num_switch = int(level * total_num_layers)
-    vec = torch.arange(total_num_layers)
-    vec = vec % (total_num_layers // num_switch)
-    vec = vec == 0
-    if to_flip:
-        vec = ~vec
-    return vec
 
 
 class StyleAlignedPatch:
@@ -176,6 +147,8 @@ class StyleAlignedPatch:
         return {
             "required": {
                 "model": ("MODEL",),
+                "share_norm": (["disabled", "group", "layer", "both"],),
+                "scale": ("FLOAT", {"default": 1, "min": 0, "max": 1.0, "step": 0.1}),
             },
             "optional": {
                 "style_image": ("IMAGE",),
@@ -189,12 +162,18 @@ class StyleAlignedPatch:
     def __init__(self) -> None:
         self.args = StyleAlignedArgs()
 
-    def patch(self, model: ModelPatcher, style_image: Optional[T] = None):
+    def patch(
+        self,
+        model: ModelPatcher,
+        share_norm: str,
+        scale: float,
+        style_image: Optional[T] = None,
+    ):
         m = model.clone()
-        register_shared_norm(
-            model, self.args.share_group_norm, self.args.share_layer_norm
-        )
-        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, style_image))
+        share_group_norm = share_norm in ["group", "both"]
+        share_layer_norm = share_norm in ["layer", "both"]
+        register_shared_norm(model, share_group_norm, share_layer_norm)
+        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale, style_image))
         return (m,)
 
 
