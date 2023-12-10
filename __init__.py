@@ -147,7 +147,7 @@ class StyleAlignedPatch:
         return {
             "required": {
                 "model": ("MODEL",),
-                "share_norm": (["disabled", "group", "layer", "both"],),
+                "share_norm": (["both", "group", "layer", "disabled"],),
                 "scale": ("FLOAT", {"default": 1, "min": 0, "max": 1.0, "step": 0.1}),
             },
             "optional": {
