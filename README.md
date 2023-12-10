@@ -8,7 +8,8 @@ Simply run `git clone git@github.com:brianfitzgerald/style_aligned_comfy.git` in
 
 ### Usage
 
-Use the example workflow from [here](resources/example_workflow.json)
+Use the example workflow from [here](resources/example_workflow.json).
+
 Or, simply add the `StyleAlignedPatch` node after `LoadCheckpoint`.
 
 ### Parameters
