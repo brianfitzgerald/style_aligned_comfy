@@ -32,22 +32,31 @@ class StyleAlignedArgs:
 
 
 def expand_ref(
-    feat: T,
-    scale=1.0,
+    latents_batch: T,
+    style_latent: Optional[T] = None,
+    scale: float = 1.0,
 ) -> T:
-    b = feat.shape[0]
-    feat_style = torch.stack((feat[0], feat[b // 2])).unsqueeze(1)
+    bsz = latents_batch.shape[0]
+    if style_latent is None:
+        style_latent = latents_batch[0]
+    # add new dim, and repeat
+    feat_style = torch.stack((style_latent, latents_batch[bsz // 2])).unsqueeze(1)
     if scale == 1:
-        feat_style = feat_style.expand(2, b // 2, *feat.shape[1:])
+        # double the tensors
+        feat_style = feat_style.expand(2, bsz // 2, *latents_batch.shape[1:])
     else:
-        feat_style = feat_style.repeat(1, b // 2, 1, 1, 1)
+        feat_style = feat_style.repeat(1, bsz // 2, 1, 1, 1)
+        # scale the tensors before doubling
         feat_style = torch.cat([feat_style[:, :1], scale * feat_style[:, 1:]], dim=1)
-    return feat_style.reshape(*feat.shape)
+    # reshape to (bsz, 1, latent_shape)
+    return feat_style.reshape(*latents_batch.shape)
 
 
-def concat_ref(feat: T, dim=2, scale=1.0) -> T:
-    feat_style = expand_ref(feat, scale=scale)
-    return torch.cat((feat, feat_style), dim=dim)
+def concat_ref(
+    latents: T, style_latent: Optional[T], dim: int = 2, scale: float = 1.0
+) -> T:
+    feat_style = expand_ref(latents, style_latent, scale)
+    return torch.cat((latents, feat_style), dim=dim)
 
 
 def calc_mean_std(feat, eps: float = 1e-5) -> tuple[T, T]:
@@ -73,9 +82,9 @@ def sdpa(q: T, k: T, v: T, mask=None, heads: int = 8) -> T:
 
 
 class SharedAttentionProcessor:
-    def __init__(self, args: StyleAlignedArgs, scale: float, style_image: Optional[T]):
+    def __init__(self, args: StyleAlignedArgs, scale: float, latent_ref: Optional[T]):
         self.args = args
-        self.ref_img = style_image
+        self.latent_ref = latent_ref
         self.scale = scale
 
     def __call__(self, q, k, v, extra_options):
@@ -86,8 +95,8 @@ class SharedAttentionProcessor:
         if self.args.adain_values:
             v = adain(v)
         if self.args.share_attention:
-            k = concat_ref(k, -2, scale=self.scale)
-            v = concat_ref(v, -2)
+            k = concat_ref(k, self.latent_ref, -2, scale=self.scale)
+            v = concat_ref(v, self.latent_ref, -2)
 
         return q, k, v
 
@@ -111,16 +120,18 @@ def get_norm_layers(
 
 def register_norm_forward(
     norm_layer: Union[nn.GroupNorm, nn.LayerNorm],
+    latent_ref: Optional[T],
 ) -> Union[nn.GroupNorm, nn.LayerNorm]:
     if not hasattr(norm_layer, "orig_forward"):
         setattr(norm_layer, "orig_forward", norm_layer.forward)
     orig_forward = norm_layer.orig_forward
+    print(f"Registering {norm_layer} with ref {latent_ref is not None}")
 
     def forward_(hidden_states: T) -> T:
-        n = hidden_states.shape[-2]
-        hidden_states = concat_ref(hidden_states, dim=-2)
+        hidden_dim = hidden_states.shape[-2]
+        hidden_states = concat_ref(hidden_states, latent_ref, dim=-2)
         hidden_states = orig_forward(hidden_states)
-        return hidden_states[..., :n, :]
+        return hidden_states[..., :hidden_dim, :]
 
     norm_layer.forward = forward_  # type: ignore
     return norm_layer
@@ -128,6 +139,7 @@ def register_norm_forward(
 
 def register_shared_norm(
     model: ModelPatcher,
+    latent_ref: Optional[T],
     share_group_norm: bool = True,
     share_layer_norm: bool = True,
 ):
@@ -136,9 +148,9 @@ def register_shared_norm(
     print(
         f"Patching {len(norm_layers['group'])} group norms, {len(norm_layers['layer'])} layer norms."
     )
-    return [register_norm_forward(layer) for layer in norm_layers["group"]] + [
-        register_norm_forward(layer) for layer in norm_layers["layer"]
-    ]
+    return [
+        register_norm_forward(layer, latent_ref) for layer in norm_layers["group"]
+    ] + [register_norm_forward(layer, latent_ref) for layer in norm_layers["layer"]]
 
 
 class StyleAlignedPatch:
@@ -167,13 +179,20 @@ class StyleAlignedPatch:
         model: ModelPatcher,
         share_norm: str,
         scale: float,
-        latent_ref: Optional[T] = None,
+        latent_ref: Optional[dict[str, T]] = None,
     ):
         m = model.clone()
         share_group_norm = share_norm in ["group", "both"]
         share_layer_norm = share_norm in ["layer", "both"]
-        register_shared_norm(model, share_group_norm, share_layer_norm)
-        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale, latent_ref))
+        latent_ref_sample = latent_ref["samples"] if latent_ref else None
+        if latent_ref_sample is not None:
+            latent_ref_sample = latent_ref_sample.to(model.load_device)
+        register_shared_norm(
+            model, latent_ref_sample, share_group_norm, share_layer_norm
+        )
+        m.set_model_attn1_patch(
+            SharedAttentionProcessor(self.args, scale, latent_ref_sample)
+        )
         return (m,)
 
 
