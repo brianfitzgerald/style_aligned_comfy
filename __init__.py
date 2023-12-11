@@ -73,9 +73,8 @@ def sdpa(q: T, k: T, v: T, mask=None, heads: int = 8) -> T:
 
 
 class SharedAttentionProcessor:
-    def __init__(self, args: StyleAlignedArgs, scale: float, style_image: Optional[T]):
+    def __init__(self, args: StyleAlignedArgs, scale: float):
         self.args = args
-        self.ref_img = style_image
         self.scale = scale
 
     def __call__(self, q, k, v, extra_options):
@@ -151,13 +150,14 @@ class StyleAlignedPatch:
                 "scale": ("FLOAT", {"default": 1, "min": 0, "max": 1.0, "step": 0.1}),
             },
             "optional": {
-                "style_image": ("IMAGE",),
+                "style_latent": ("LATENT",),
+                "latent_batch": ("LATENT",),
             },
         }
 
-    RETURN_TYPES = ("MODEL",)
+    RETURN_TYPES = ("MODEL", "LATENT")
     FUNCTION = "patch"
-    CATEGORY = "custom_node_experiments"
+    CATEGORY = "advanced"
 
     def __init__(self) -> None:
         self.args = StyleAlignedArgs()
@@ -167,16 +167,46 @@ class StyleAlignedPatch:
         model: ModelPatcher,
         share_norm: str,
         scale: float,
-        style_image: Optional[T] = None,
-    ):
+        style_latent: Optional[dict[str, T]] = None,
+        latent_batch: Optional[dict[str, T]] = None,
+    ) -> tuple[ModelPatcher, Optional[dict[str, T]]]:
         m = model.clone()
+
+        # Register shared norms
         share_group_norm = share_norm in ["group", "both"]
         share_layer_norm = share_norm in ["layer", "both"]
         register_shared_norm(model, share_group_norm, share_layer_norm)
-        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale, style_image))
-        return (m,)
+
+        # Patch cross attn
+        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale))
+
+        # Concat batch with style latent
+        if style_latent is not None and latent_batch is not None:
+            latent_batch["samples"] = torch.cat(
+                (style_latent["samples"], latent_batch["samples"]), dim=0
+            )
+
+        return (m, latent_batch)
+
+
+class LatentRemoveFromBatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "remove"
+
+    def remove(self, latent: dict[str, T]) -> tuple[T]:
+        sliced = latent["samples"][1:, ...]
+        return (sliced,)
 
 
 NODE_CLASS_MAPPINGS = {
     "StyleAlignedPatch": StyleAlignedPatch,
+    "LatentRemoveFromBatch": LatentRemoveFromBatch,
 }
