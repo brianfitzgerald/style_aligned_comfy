@@ -1,12 +1,13 @@
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
-from torch.nn import functional as nnf
-import einops
 from comfy.model_patcher import ModelPatcher
 from comfy.ldm.modules.attention import optimized_attention, optimized_attention_masked
 import comfy.ops
 from typing import Optional, Union
+import comfy.sample
+import latent_preview
+import comfy.utils
 
 T = torch.Tensor
 
@@ -140,7 +141,7 @@ def register_shared_norm(
     ]
 
 
-class StyleAlignedPatch:
+class StyleAlignedSample:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -148,14 +149,31 @@ class StyleAlignedPatch:
                 "model": ("MODEL",),
                 "share_norm": (["both", "group", "layer", "disabled"],),
                 "scale": ("FLOAT", {"default": 1, "min": 0, "max": 1.0, "step": 0.1}),
-            },
-            "optional": {
-                "style_latent": ("LATENT",),
-                "latent_batch": ("LATENT",),
+                "batch_size": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1}),
+                "noise_seed": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF},
+                ),
+                "cfg": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.1,
+                        "round": 0.01,
+                    },
+                ),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "ref_latent": ("LATENT",),
             },
         }
 
-    RETURN_TYPES = ("MODEL", "LATENT")
+    RETURN_TYPES = ("LATENT", "LATENT")
+    RETURN_NAMES = ("output", "denoised_output")
     FUNCTION = "patch"
     CATEGORY = "advanced"
 
@@ -167,10 +185,35 @@ class StyleAlignedPatch:
         model: ModelPatcher,
         share_norm: str,
         scale: float,
-        style_latent: Optional[dict[str, T]] = None,
-        latent_batch: Optional[dict[str, T]] = None,
-    ) -> tuple[ModelPatcher, Optional[dict[str, T]]]:
+        batch_size: int,
+        noise_seed: int,
+        cfg: float,
+        positive: T,
+        negative: T,
+        sampler: T,
+        sigmas: T,
+        ref_latent: dict[str, T],
+    ) -> tuple[dict, dict]:
         m = model.clone()
+
+
+        # Concat batch with style latent
+        style_latent_tensor = ref_latent["samples"]
+        height, width = style_latent_tensor.shape[-2:]
+        latent_t = torch.zeros(
+            [batch_size, 4, height, width], device=ref_latent["samples"].device
+        )
+        latent = {"samples": latent_t}
+        noise = comfy.sample.prepare_noise(latent_t, noise_seed)
+
+        latent_t = torch.cat((style_latent_tensor, latent_t), dim=0)
+        ref_noise = torch.zeros_like(noise[0]).unsqueeze(0)
+        noise = torch.cat((ref_noise, noise), dim=0)
+
+        x0_output = {}
+        callback = latent_preview.prepare_callback(
+            model, sigmas.shape[-1] - 1, x0_output
+        )
 
         # Register shared norms
         share_group_norm = share_norm in ["group", "both"]
@@ -180,33 +223,37 @@ class StyleAlignedPatch:
         # Patch cross attn
         m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale))
 
-        # Concat batch with style latent
-        if style_latent is not None and latent_batch is not None:
-            latent_batch["samples"] = torch.cat(
-                (style_latent["samples"], latent_batch["samples"]), dim=0
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        samples = comfy.sample.sample_custom(
+            m,
+            noise,
+            cfg,
+            sampler,
+            sigmas,
+            positive,
+            negative,
+            latent_t,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=noise_seed,
+        )
+        
+        # remove reference image
+        samples = samples[1:]
+
+        out = latent.copy()
+        out["samples"] = samples
+        if "x0" in x0_output:
+            out_denoised = latent.copy()
+            x0 = x0_output["x0"][1:]
+            out_denoised["samples"] = m.model.process_latent_out(
+                x0.cpu()
             )
-
-        return (m, latent_batch)
-
-
-class LatentRemoveFromBatch:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "remove"
-
-    def remove(self, latent: dict[str, T]) -> tuple[T]:
-        sliced = latent["samples"][1:, ...]
-        return (sliced,)
+        else:
+            out_denoised = out
+        return (out, out_denoised)
 
 
 NODE_CLASS_MAPPINGS = {
-    "StyleAlignedPatch": StyleAlignedPatch,
-    "LatentRemoveFromBatch": LatentRemoveFromBatch,
+    "StyleAlignedSample": StyleAlignedSample,
 }
