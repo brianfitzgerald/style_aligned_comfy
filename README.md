@@ -1,8 +1,8 @@
 # StyleAligned for ComfyUI
 
-Implementation of the [StyleAligned](https://style-aligned-gen.github.io/) paper for ComfyUI.
+Implementation of the [StyleAligned](https://style-aligned-gen.github.io/) technique for ComfyUI.
 
-This implementation is split into two different nodes:
+This implementation is split into two different nodes, and does not require any additional models or dependencies.
 
 #### StyleAligned Reference Sampler
 
@@ -35,4 +35,4 @@ _A batch of generations with the same parameters and the Batch Align node applie
 
 ### Installation
 
-Simply download or git clone this repository in `ComfyUI/custom_nodes/`.
+Simply download or git clone this repository in `ComfyUI/custom_nodes/`. Example workflows are included in `resources/`.
