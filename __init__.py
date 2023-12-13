@@ -144,7 +144,7 @@ def register_shared_norm(
 SHARE_NORM_OPTIONS = ["both", "group", "layer", "disabled"]
 
 
-class StyleAlignWithRefSampler:
+class StyleAlignedReferenceSampler:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -254,7 +254,7 @@ class StyleAlignWithRefSampler:
         return (out, out_denoised)
 
 
-class StyleAlignWithinBatch:
+class StyleAlignedBatchAlign:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -287,12 +287,12 @@ class StyleAlignWithinBatch:
 
 
 NODE_CLASS_MAPPINGS = {
-    "StyleAlignWithRefSampler": StyleAlignWithRefSampler,
-    "StyleAlignWithinBatch": StyleAlignWithinBatch,
+    "StyleAlignedReferenceSampler": StyleAlignedReferenceSampler,
+    "StyleAlignedBatchAlign": StyleAlignedBatchAlign,
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "StyleAlignWithRefSampler": "StyleAligned Reference Sampler",
-    "StyleAlignWithinBatch": "StyleAligned Within Batch",
+    "StyleAlignedReferenceSampler": "StyleAligned Reference Sampler",
+    "StyleAlignedBatchAlign": "StyleAligned Batch Align",
 }
