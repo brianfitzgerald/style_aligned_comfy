@@ -214,13 +214,13 @@ class StyleAlignedReferenceSampler:
 
         x0_output = {}
         callback = latent_preview.prepare_callback(
-            model, sigmas.shape[-1] - 1, x0_output
+            m, sigmas.shape[-1] - 1, x0_output
         )
 
         # Register shared norms
         share_group_norm = share_norm in ["group", "both"]
         share_layer_norm = share_norm in ["layer", "both"]
-        register_shared_norm(model, share_group_norm, share_layer_norm)
+        register_shared_norm(m, share_group_norm, share_layer_norm)
 
         # Patch cross attn
         m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale))
