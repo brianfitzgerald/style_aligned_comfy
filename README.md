@@ -15,6 +15,7 @@ _Above, a reference image, and a batch of images generated using the prompt 'a r
 ##### Parameters
 
 - `model`: The base model to patch.
+- `share_attn`: Which components of self-attention are normalized. Defaults to `q+k`. Set to `q+k+v` for more extreme sharing, at the cost of quality in some cases.
 - `share_norm`: Whether to share normalization across the batch. Defaults to `both`. Set to `group` or `layer` to only share group or layer normalization, respectively.
 - `scale`: The scale at which to apply the style-alignment effect. Defaults to `1`.
 
