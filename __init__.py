@@ -22,20 +22,25 @@ def default(val, d):
     return d
 
 
-@dataclass(frozen=True)
 class StyleAlignedArgs:
+    def __init__(self, share_attn: str) -> None:
+        self.adain_keys = "k" in share_attn
+        self.adain_values = "v" in share_attn
+        self.adain_queries = "q" in share_attn
+
     share_attention: bool = True
     adain_queries: bool = True
     adain_keys: bool = True
-    adain_values: bool = False
-    shared_score_shift: float = 0.0
-    only_self_level: float = 0.0
+    adain_values: bool = True
 
 
 def expand_first(
     feat: T,
     scale=1.0,
 ) -> T:
+    """
+    Expand the first element so it has the same shape as the rest of the batch.
+    """
     b = feat.shape[0]
     feat_style = torch.stack((feat[0], feat[b // 2])).unsqueeze(1)
     if scale == 1:
@@ -47,6 +52,9 @@ def expand_first(
 
 
 def concat_first(feat: T, dim=2, scale=1.0) -> T:
+    """
+    concat the the feature and the style feature expanded above
+    """
     feat_style = expand_first(feat, scale=scale)
     return torch.cat((feat, feat_style), dim=dim)
 
@@ -142,6 +150,7 @@ def register_shared_norm(
 
 
 SHARE_NORM_OPTIONS = ["both", "group", "layer", "disabled"]
+SHARE_ATTN_OPTIONS = ["q+k", "q+k+v", "disabled"]
 
 
 class StyleAlignedReferenceSampler:
@@ -151,6 +160,7 @@ class StyleAlignedReferenceSampler:
             "required": {
                 "model": ("MODEL",),
                 "share_norm": (SHARE_NORM_OPTIONS,),
+                "share_attn": (SHARE_ATTN_OPTIONS,),
                 "scale": ("FLOAT", {"default": 1, "min": 0, "max": 2.0, "step": 0.1}),
                 "batch_size": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1}),
                 "noise_seed": (
@@ -180,13 +190,11 @@ class StyleAlignedReferenceSampler:
     FUNCTION = "patch"
     CATEGORY = "style_aligned"
 
-    def __init__(self) -> None:
-        self.args = StyleAlignedArgs()
-
     def patch(
         self,
         model: ModelPatcher,
         share_norm: str,
+        share_attn: str,
         scale: float,
         batch_size: int,
         noise_seed: int,
@@ -198,6 +206,7 @@ class StyleAlignedReferenceSampler:
         ref_latent: "dict[str, T]",
     ) -> "tuple[dict, dict]":
         m = model.clone()
+        args = StyleAlignedArgs(share_attn)
 
         # Concat batch with style latent
         style_latent_tensor = ref_latent["samples"]
@@ -213,17 +222,15 @@ class StyleAlignedReferenceSampler:
         noise = torch.cat((ref_noise, noise), dim=0)
 
         x0_output = {}
-        callback = latent_preview.prepare_callback(
-            model, sigmas.shape[-1] - 1, x0_output
-        )
+        callback = latent_preview.prepare_callback(m, sigmas.shape[-1] - 1, x0_output)
 
         # Register shared norms
         share_group_norm = share_norm in ["group", "both"]
         share_layer_norm = share_norm in ["layer", "both"]
-        register_shared_norm(model, share_group_norm, share_layer_norm)
+        register_shared_norm(m, share_group_norm, share_layer_norm)
 
         # Patch cross attn
-        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale))
+        m.set_model_attn1_patch(SharedAttentionProcessor(args, scale))
 
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
         samples = comfy.sample.sample_custom(
@@ -261,6 +268,7 @@ class StyleAlignedBatchAlign:
             "required": {
                 "model": ("MODEL",),
                 "share_norm": (SHARE_NORM_OPTIONS,),
+                "share_attn": (SHARE_ATTN_OPTIONS,),
                 "scale": ("FLOAT", {"default": 1, "min": 0, "max": 1.0, "step": 0.1}),
             }
         }
@@ -269,20 +277,19 @@ class StyleAlignedBatchAlign:
     FUNCTION = "patch"
     CATEGORY = "style_aligned"
 
-    def __init__(self) -> None:
-        self.args = StyleAlignedArgs()
-
     def patch(
         self,
         model: ModelPatcher,
         share_norm: str,
+        share_attn: str,
         scale: float,
     ):
         m = model.clone()
         share_group_norm = share_norm in ["group", "both"]
         share_layer_norm = share_norm in ["layer", "both"]
         register_shared_norm(model, share_group_norm, share_layer_norm)
-        m.set_model_attn1_patch(SharedAttentionProcessor(self.args, scale))
+        args = StyleAlignedArgs(share_attn)
+        m.set_model_attn1_patch(SharedAttentionProcessor(args, scale))
         return (m,)
 
 
