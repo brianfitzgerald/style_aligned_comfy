@@ -2,9 +2,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from comfy.model_patcher import ModelPatcher
-from comfy.ldm.modules.attention import optimized_attention, optimized_attention_masked
 import comfy.ops
-from typing import Optional, Union
+from typing import Union
 import comfy.sample
 import latent_preview
 import comfy.utils
@@ -64,7 +63,6 @@ def calc_mean_std(feat, eps: float = 1e-5) -> "tuple[T, T]":
     feat_mean = feat.mean(dim=-2, keepdims=True)
     return feat_mean, feat_std
 
-
 def adain(feat: T) -> T:
     feat_mean, feat_std = calc_mean_std(feat)
     feat_style_mean = expand_first(feat_mean)
@@ -72,14 +70,6 @@ def adain(feat: T) -> T:
     feat = (feat - feat_mean) / feat_std
     feat = feat * feat_style_std + feat_style_mean
     return feat
-
-
-def sdpa(q: T, k: T, v: T, mask=None, heads: int = 8) -> T:
-    if mask:
-        return optimized_attention_masked(q, k, v, heads, mask)
-    else:
-        return optimized_attention(q, k, v, heads)
-
 
 class SharedAttentionProcessor:
     def __init__(self, args: StyleAlignedArgs, scale: float):
@@ -228,6 +218,7 @@ class StyleAlignedReferenceSampler:
                 ),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
+                "ref_positive": ("CONDITIONING",),
                 "sampler": ("SAMPLER",),
                 "sigmas": ("SIGMAS",),
                 "ref_latents": ("STEP_LATENTS",),
@@ -250,6 +241,7 @@ class StyleAlignedReferenceSampler:
         cfg: float,
         positive: T,
         negative: T,
+        ref_positive: T,
         sampler: T,
         sigmas: T,
         ref_latents: T,
@@ -273,6 +265,7 @@ class StyleAlignedReferenceSampler:
         x0_output = {}
         preview_callback = latent_preview.prepare_callback(m, sigmas.shape[-1] - 1, x0_output)
 
+        # Replace first latent with the corresponding reference latent after each step
         def callback(step: int, x0: T, x: T, steps: int):
             preview_callback(step, x0, x, steps)
             if (step < steps):
@@ -287,6 +280,12 @@ class StyleAlignedReferenceSampler:
         # Patch cross attn
         m.set_model_attn1_patch(SharedAttentionProcessor(args, scale))
 
+        # Add reference conditioning to batch 
+        batched_condition = []
+        for i,condition in enumerate(positive):
+            bath_with_reference = torch.cat([ref_positive[i][0], condition[0].repeat([batch_size] + [1] * len(condition[0].shape[1:]))], dim=0)
+            batched_condition.append([bath_with_reference, condition[1]])
+
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
         samples = comfy.sample.sample_custom(
             m,
@@ -294,7 +293,7 @@ class StyleAlignedReferenceSampler:
             cfg,
             sampler,
             sigmas,
-            positive,
+            batched_condition,
             negative,
             latent_t,
             callback=callback,
