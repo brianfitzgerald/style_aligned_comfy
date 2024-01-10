@@ -290,13 +290,21 @@ class StyleAlignedReferenceSampler:
                 pooled_output = torch.cat([ref_positive[i][1]['pooled_output'], additional['pooled_output'].repeat([batch_size] 
                     + [1] * len(additional['pooled_output'].shape[1:]))], dim=0)
                 additional['pooled_output'] = pooled_output
-            if 'control' in additional and 'control' in ref_positive[i][1]:
-                # combine control conditioning
-                control_hint = torch.cat([ref_positive[i][1]['control'].cond_hint_original, additional['control'].cond_hint_original.repeat([batch_size] 
-                    + [1] * len(additional['control'].cond_hint_original.shape[1:]))], dim=0)
-                cloned_controlnet = additional['control'].copy()
-                cloned_controlnet.set_cond_hint(control_hint, strength=additional['control'].strength, timestep_percent_range=additional['control'].timestep_percent_range)
-                additional['control'] = cloned_controlnet
+            if 'control' in additional:
+                if 'control' in ref_positive[i][1]:
+                    # combine control conditioning
+                    control_hint = torch.cat([ref_positive[i][1]['control'].cond_hint_original, additional['control'].cond_hint_original.repeat([batch_size] 
+                        + [1] * len(additional['control'].cond_hint_original.shape[1:]))], dim=0)
+                    cloned_controlnet = additional['control'].copy()
+                    cloned_controlnet.set_cond_hint(control_hint, strength=additional['control'].strength, timestep_percent_range=additional['control'].timestep_percent_range)
+                    additional['control'] = cloned_controlnet
+                else:
+                    # add zeros for first in batch
+                    control_hint = torch.cat([torch.zeros_like(additional['control'].cond_hint_original), additional['control'].cond_hint_original.repeat([batch_size] 
+                        + [1] * len(additional['control'].cond_hint_original.shape[1:]))], dim=0)
+                    cloned_controlnet = additional['control'].copy()
+                    cloned_controlnet.set_cond_hint(control_hint, strength=additional['control'].strength, timestep_percent_range=additional['control'].timestep_percent_range)
+                    additional['control'] = cloned_controlnet
             batched_condition.append([batch_with_reference, additional])
 
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
