@@ -268,9 +268,9 @@ class StyleAlignedReferenceSampler:
         # Replace first latent with the corresponding reference latent after each step
         def callback(step: int, x0: T, x: T, steps: int):
             preview_callback(step, x0, x, steps)
-            if (step < steps):
-                x[0] = ref_latents[step]
-                x0[0] = ref_latents[step]
+            if (step + 1 < steps):
+                x[0] = ref_latents[step+1]
+                x0[0] = ref_latents[step+1]
 
         # Register shared norms
         share_group_norm = share_norm in ["group", "both"]
