@@ -2,9 +2,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from comfy.model_patcher import ModelPatcher
-from comfy.ldm.modules.attention import optimized_attention, optimized_attention_masked
 import comfy.ops
-from typing import Optional, Union
+from typing import Union
 import comfy.sample
 import latent_preview
 import comfy.utils
@@ -64,7 +63,6 @@ def calc_mean_std(feat, eps: float = 1e-5) -> "tuple[T, T]":
     feat_mean = feat.mean(dim=-2, keepdims=True)
     return feat_mean, feat_std
 
-
 def adain(feat: T) -> T:
     feat_mean, feat_std = calc_mean_std(feat)
     feat_style_mean = expand_first(feat_mean)
@@ -72,14 +70,6 @@ def adain(feat: T) -> T:
     feat = (feat - feat_mean) / feat_std
     feat = feat * feat_style_std + feat_style_mean
     return feat
-
-
-def sdpa(q: T, k: T, v: T, mask=None, heads: int = 8) -> T:
-    if mask:
-        return optimized_attention_masked(q, k, v, heads, mask)
-    else:
-        return optimized_attention(q, k, v, heads)
-
 
 class SharedAttentionProcessor:
     def __init__(self, args: StyleAlignedArgs, scale: float):
@@ -152,6 +142,55 @@ def register_shared_norm(
 SHARE_NORM_OPTIONS = ["both", "group", "layer", "disabled"]
 SHARE_ATTN_OPTIONS = ["q+k", "q+k+v", "disabled"]
 
+class StyleAlignedSampleReferenceLatents:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":
+                    {"model": ("MODEL",),
+                    "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                    "cfg": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step":0.1, "round": 0.01}),
+                    "positive": ("CONDITIONING", ),
+                    "negative": ("CONDITIONING", ),
+                    "sampler": ("SAMPLER", ),
+                    "sigmas": ("SIGMAS", ),
+                    "latent_image": ("LATENT", ),
+                     }
+                }
+
+    RETURN_TYPES = ("STEP_LATENTS","LATENT")
+    RETURN_NAMES = ("ref_latents", "noised_output")
+
+    FUNCTION = "sample"
+
+    CATEGORY = "style_aligned"
+
+    def sample(self, model, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image):
+        sigmas = sigmas.flip(0)
+        if sigmas[0] == 0:
+            sigmas[0] = 0.0001
+
+        latent = latent_image
+        latent_image = latent["samples"]
+        noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
+
+        noise_mask = None
+        if "noise_mask" in latent:
+            noise_mask = latent["noise_mask"]
+
+        ref_latents = []
+        def callback(step: int, x0: T, x: T, steps: int):
+            ref_latents.insert(0, x[0])
+        
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        samples = comfy.sample.sample_custom(model, noise, cfg, sampler, sigmas, positive, negative, latent_image, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=noise_seed)
+
+        out = latent.copy()
+        out["samples"] = samples
+        out_noised = out
+
+        ref_latents = torch.stack(ref_latents)
+
+        return (ref_latents, out_noised)
 
 class StyleAlignedReferenceSampler:
     @classmethod
@@ -161,7 +200,7 @@ class StyleAlignedReferenceSampler:
                 "model": ("MODEL",),
                 "share_norm": (SHARE_NORM_OPTIONS,),
                 "share_attn": (SHARE_ATTN_OPTIONS,),
-                "scale": ("FLOAT", {"default": 1, "min": 0, "max": 2.0, "step": 0.1}),
+                "scale": ("FLOAT", {"default": 1, "min": 0, "max": 2.0, "step": 0.01}),
                 "batch_size": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1}),
                 "noise_seed": (
                     "INT",
@@ -179,9 +218,10 @@ class StyleAlignedReferenceSampler:
                 ),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
+                "ref_positive": ("CONDITIONING",),
                 "sampler": ("SAMPLER",),
                 "sigmas": ("SIGMAS",),
-                "ref_latent": ("LATENT",),
+                "ref_latents": ("STEP_LATENTS",),
             },
         }
 
@@ -201,18 +241,19 @@ class StyleAlignedReferenceSampler:
         cfg: float,
         positive: T,
         negative: T,
+        ref_positive: T,
         sampler: T,
         sigmas: T,
-        ref_latent: "dict[str, T]",
+        ref_latents: T,
     ) -> "tuple[dict, dict]":
         m = model.clone()
         args = StyleAlignedArgs(share_attn)
 
         # Concat batch with style latent
-        style_latent_tensor = ref_latent["samples"]
+        style_latent_tensor = ref_latents[0].unsqueeze(0)
         height, width = style_latent_tensor.shape[-2:]
         latent_t = torch.zeros(
-            [batch_size, 4, height, width], device=ref_latent["samples"].device
+            [batch_size, 4, height, width], device=ref_latents.device
         )
         latent = {"samples": latent_t}
         noise = comfy.sample.prepare_noise(latent_t, noise_seed)
@@ -222,7 +263,14 @@ class StyleAlignedReferenceSampler:
         noise = torch.cat((ref_noise, noise), dim=0)
 
         x0_output = {}
-        callback = latent_preview.prepare_callback(m, sigmas.shape[-1] - 1, x0_output)
+        preview_callback = latent_preview.prepare_callback(m, sigmas.shape[-1] - 1, x0_output)
+
+        # Replace first latent with the corresponding reference latent after each step
+        def callback(step: int, x0: T, x: T, steps: int):
+            preview_callback(step, x0, x, steps)
+            if (step + 1 < steps):
+                x[0] = ref_latents[step+1]
+                x0[0] = ref_latents[step+1]
 
         # Register shared norms
         share_group_norm = share_norm in ["group", "both"]
@@ -232,6 +280,33 @@ class StyleAlignedReferenceSampler:
         # Patch cross attn
         m.set_model_attn1_patch(SharedAttentionProcessor(args, scale))
 
+        # Add reference conditioning to batch 
+        batched_condition = []
+        for i,condition in enumerate(positive):
+            additional = condition[1].copy()
+            batch_with_reference = torch.cat([ref_positive[i][0], condition[0].repeat([batch_size] + [1] * len(condition[0].shape[1:]))], dim=0)
+            if 'pooled_output' in additional and 'pooled_output' in ref_positive[i][1]:
+                # combine pooled output
+                pooled_output = torch.cat([ref_positive[i][1]['pooled_output'], additional['pooled_output'].repeat([batch_size] 
+                    + [1] * len(additional['pooled_output'].shape[1:]))], dim=0)
+                additional['pooled_output'] = pooled_output
+            if 'control' in additional:
+                if 'control' in ref_positive[i][1]:
+                    # combine control conditioning
+                    control_hint = torch.cat([ref_positive[i][1]['control'].cond_hint_original, additional['control'].cond_hint_original.repeat([batch_size] 
+                        + [1] * len(additional['control'].cond_hint_original.shape[1:]))], dim=0)
+                    cloned_controlnet = additional['control'].copy()
+                    cloned_controlnet.set_cond_hint(control_hint, strength=additional['control'].strength, timestep_percent_range=additional['control'].timestep_percent_range)
+                    additional['control'] = cloned_controlnet
+                else:
+                    # add zeros for first in batch
+                    control_hint = torch.cat([torch.zeros_like(additional['control'].cond_hint_original), additional['control'].cond_hint_original.repeat([batch_size] 
+                        + [1] * len(additional['control'].cond_hint_original.shape[1:]))], dim=0)
+                    cloned_controlnet = additional['control'].copy()
+                    cloned_controlnet.set_cond_hint(control_hint, strength=additional['control'].strength, timestep_percent_range=additional['control'].timestep_percent_range)
+                    additional['control'] = cloned_controlnet
+            batched_condition.append([batch_with_reference, additional])
+
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
         samples = comfy.sample.sample_custom(
             m,
@@ -239,7 +314,7 @@ class StyleAlignedReferenceSampler:
             cfg,
             sampler,
             sigmas,
-            positive,
+            batched_condition,
             negative,
             latent_t,
             callback=callback,
@@ -295,11 +370,13 @@ class StyleAlignedBatchAlign:
 
 NODE_CLASS_MAPPINGS = {
     "StyleAlignedReferenceSampler": StyleAlignedReferenceSampler,
+    "StyleAlignedSampleReferenceLatents": StyleAlignedSampleReferenceLatents,
     "StyleAlignedBatchAlign": StyleAlignedBatchAlign,
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StyleAlignedReferenceSampler": "StyleAligned Reference Sampler",
+    "StyleAlignedSampleReferenceLatents": "StyleAligned Sample Reference Latents",
     "StyleAlignedBatchAlign": "StyleAligned Batch Align",
 }
