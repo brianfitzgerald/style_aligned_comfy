@@ -1,3 +1,7 @@
+
+> [!WARNING]  
+> This repo is no longer actively maintained; please look for other forks or projects for similar functionality. If you've downloaded and used it in the past, thank you!
+
 # StyleAligned for ComfyUI
 
 Implementation of the [StyleAligned](https://style-aligned-gen.github.io/) technique for ComfyUI.
